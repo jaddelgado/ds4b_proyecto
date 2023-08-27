@@ -1,0 +1,267 @@
+---
+Proyecto: "Cross-Selling predicting model"
+Recurso: "Development Code"
+Autor: Juan Delgado
+editor_options: 
+  chunk_output_type: console
+---
+
+0 - Parameters
+
+```{r}
+
+options(scipen=999) # disable scientific notation
+
+```
+
+1 -  Environment setup 
+
+1.1. Library load
+
+```{r message=FALSE, warning=FALSE}
+paquetes <- c('data.table',
+              'dplyr',
+              'tidyr',
+              'ggplot2',
+              'randomForest',
+              'ROCR',
+              'purrr',
+              'smbinning',
+              'rpart',
+              'rpart.plot')
+
+instalados <- paquetes %in% installed.packages()
+
+if(sum(instalados == FALSE) > 0) {
+  install.packages(paquetes[!instalados])
+}
+lapply(paquetes,require,character.only = TRUE)
+
+```
+
+1.2 - Data load.
+
+```{r}
+
+df <- fread('datos.csv')
+
+
+```
+
+2 - Exploratory Data Analysis.
+2.1 - General Data and Data type.
+
+```{r echo=TRUE}
+
+as.data.frame(sort(names(df)))
+str(df)
+glimpse(as_tibble(df))
+
+
+
+```
+
+We have May and June variables, but due to project design June will be the target and May will be blinded. So we will get rid of all May variables and those from June not target.
+
+Other variables should be factors: NUM_QUEJAS FALLEC, DUD_SUBJ, SEXO, SEGURO_VIDA, SEGURO_HOGAR, SEGURO_RESTO, SEGURO_AUTO --> recode. For now, we save them as to_factors variable
+
+```{r}
+
+#grepl allow search a string inside other string
+patron <- '_MAY|_JUN'
+may_june_vars <- names(df)[grepl(patron, names(df))]
+may_june_vars <- setdiff(may_june_vars,'SALDO_DEPOS_JUN')
+# this variable will be the target so 
+```
+
+```{r}
+
+to_factors <- c('NUM_QUEJAS', 'FALLEC', 'DUD_SUBJ', 'SEXO', 
+                'SEGURO_AUTO_FEB','SEGURO_AUTO_MAR', 
+                'SEGURO_AUTO_ABR','SEGURO_HOGAR_FEB','SEGURO_HOGAR_MAR', 
+                'SEGURO_HOGAR_ABR','SEGURO_VIDA_FEB','SEGURO_VIDA_MAR', 
+                'SEGURO_VIDA_ABR','SEGURO_RESTO_FEB','SEGURO_RESTO_MAR', 
+                'SEGURO_RESTO_ABR')
+
+```
+
+2.2 - Data Quality. Basics Statistics
+
+We get a list of the summary of each variable.
+```{r}
+
+lapply(df,summary)
+
+```
+
+
+2.3 - Data Quality. Null Analysis
+
+```{r}
+
+data.frame(colSums(is.na(df)))
+
+```
+Nulls might be converted to zero.
+
+2.4 - Data Quality. Zero analysis.
+
+
+```{r}
+
+contar_ceros <- function(variable) {
+    temp <- transmute(df,if_else(variable==0,1,0))
+    sum(temp)
+}
+
+num_ceros <- sapply(df,contar_ceros)
+
+# num_ceros <- data.frame(VARIABLE=names(num_ceros),CEROS = num_ceros, stringAsFactors = F) 
+
+# as.numeric(num_ceros),stringsAsFactors = F)
+
+num_ceros <- data.frame(VARIABLE=names(num_ceros),CEROS = as.numeric(num_ceros),stringsAsFactors = F)
+
+num_ceros <- num_ceros %>%
+  arrange(desc(CEROS)) %>%
+  mutate(PORCENTAJE = CEROS / nrow(df) * 100)
+num_ceros
+
+
+```
+
+
+There are some variable with almost no info. We could store them as var_wo_info to eliminate them
+
+We will not include SALDO_DEPOS_ABR without data according to db design and FALLECIDOS since the number is low
+
+
+```{r}
+
+var_sin_info <- c('NUM_QUEJAS','DUD_SUBJ','SEGURO_AUTO_FEB','SEGURO_AUTO_MAR','SEGURO_AUTO_ABR')
+
+```
+
+
+2.5 - Data Quality. Outlier analysis.
+
+
+```{r}
+out <- function(variable){
+  t(t(head(sort(variable,decreasing = T),20))) 
+}
+
+lapply(df,function(x){
+  if(is.double(x)) out(x)
+})
+```
+
+We should note those variables with outliers. However from the business point of view there are none.
+
+
+```{r}
+
+out <- function(variable){
+  t(t(table(variable))) 
+}
+
+lapply(df %>% select(is.integer),function(x){
+  if(is.integer(x)) out(x)
+})
+
+
+```
+
+
+2.6 - Long Analysis
+
+```{r}
+longi <- df %>% 
+  summarise_all(mean) %>% #calcular la media de cada variable
+  t() %>% #trasponerlo para tenerlo en una sola columna y leerlo mejor
+  as.data.frame() #reconvertirlo a dataframe porque t() lo pasa a matriz
+data.frame(variable = rownames(longi), media = longi$V1) %>% #crear un nuevo dataframe para poder ordenar por el nombre
+  arrange(desc(variable)) #ordenar por el nombre para tener la visión longitudinal
+```
+
+All variables appear to be right except 1) movimiento al haber (CREDIT MOVEMENT) higher in February and 2) both Debit and Credit Movement, lower in April.
+
+Lets go deeper into case 1)
+We sum the top 10 values for the 
+```{r}
+df %>% 
+  select(IMPMOV_HABER_FEB,IMPMOV_HABER_MAR,IMPMOV_HABER_ABR) %>% 
+  map(~ sum(head(sort(.x,decreasing = T),10)))
+df %>% 
+  select(IMPMOV_HABER_FEB,IMPMOV_HABER_MAR,IMPMOV_HABER_ABR) %>% 
+  map(~ sum(head(sort(.x,decreasing = T),10000)))
+```
+
+A the top 10 records sum a huge amount. So apparently there will be some outliers. Since we will discretize in a following step, we will take care of that later.
+
+Regarding step 2)
+```{r}
+df %>% 
+  select(contains('IMPMOV_DEBE')) %>% 
+  summary()
+```
+On the contrary to we find in other months, in April, the median is 0. This suggest that there will be more 0. We will focus on this variable in our zero-analysis.
+
+```{r}
+num_ceros %>% filter(grepl('IMPMOV_DEBE',VARIABLE)) #grepl busca una cadena en una variable y devuelve un vector lógico que filter usa para quedarse con las que ha encontrado
+```
+
+There must be a quality issue in IMPMOV_DEBE_ABR variable, since there are a 10 percent more of zeros than in the rest of variables. We should discard this variable.
+
+2.7 Coherence Analysis
+
+In this particular case, we do not have variable to test against other to test its coherence.
+
+2.8 Others
+
+2.8.1 Customer Age and Tenure.
+
+We saw rare values of -999. We will look into these records to see whether the rest of variables data is ok.
+
+```{r}
+df %>% 
+  filter(EDAD == -999) %>%
+  select(EDAD,SALDO1ER_PASIVO_FEB,SALDO1ER_PASIVO_MAR,SALDO1ER_PASIVO_ABR) 
+```
+There are 124 records with -999. The rest of variables has valid data so we will use these records, imputing the age at a later stage.
+
+We use an histogram to analyze the tenure of customers:
+```{r}
+hist(df$ANTIGUEDAD,breaks = 50)
+```
+This 243 months or approximately 20 years might be due to a change in the transactional system where all customers where migrated.
+
+This variable will be discretized.
+
+2.9 - Summary of actions:
+
+Vamos a hacer lo siguiente:
+
+- Eliminate variables without information
+- Transform to factor variables in  'to_factors' list.
+- Eliminate variables debit movement "movimientos al debe"
+- Regarding outliers, we are going to discretize.
+- Impute 124 cases with -999 as age.
+- Eliminate "fallecidos" (deceased customers)
+- Eliminate variables of May and June.
+
+We do all that with the following chunk of code:
+
+
+```{r}
+df <- df %>%
+  filter(FALLEC == 0) %>%  # filter deceased
+  mutate(EDAD = ifelse(EDAD == -999, median(EDAD), EDAD)) %>%  #filter age
+  mutate_at(to_factors,.funs = factor) %>% # factors
+  select(-FALLEC) %>% 
+  select(-one_of(union(var_sin_info,may_june_vars))) %>% 
+  select(-contains('IMPMOV_DEBE')) # eliminate variables without info
+```
+
+
+
